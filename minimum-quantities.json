@@ -1,0 +1,14 @@
+{
+    "frontside": {
+        "iron": 0,
+        "copper": 0,
+        "coal": 0,
+        "stone": 0
+    },
+    "backside": {
+        "iron": 3300,
+        "copper": 3000,
+        "coal": 300,
+        "stone": 300
+    }
+}
