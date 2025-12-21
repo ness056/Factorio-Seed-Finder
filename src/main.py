@@ -37,11 +37,11 @@ class Zone:
         self.stone_area: int = 0
 
         self.starting_area_pos: Tuple[int, int] = (0, 0)
-        self.iron_coal_distance: float = math.inf
-        self.iron_copper_distance: float = math.inf
-        self.iron_stone_distance: float = math.inf
+        self.iron_coal_distance: float = 1e20
+        self.iron_copper_distance: float = 1e20
+        self.iron_stone_distance: float = 1e20
 
-        self.coal_lake_distance: float = math.inf
+        self.coal_lake_distance: float = 1e20
 
 class MapData:
     def __init__(self, seed: int):
@@ -63,7 +63,7 @@ def RunFactorio(first: int, last: int, size: int, offset: Position, mods: Path, 
     data_path = factorio_data / f"{threading.get_ident()}"
     os.makedirs(data_path, exist_ok=True)
     with open(data_path / "config.ini", "w") as f:
-        f.write(f"[path]\nwrite-data={data_path}{os.sep}")
+        f.write(f"[path]\nwrite-data={data_path}{os.sep}\nread-data=__PATH__executable__/../../data")
 
     process = subprocess.Popen([
         factorio_path,
@@ -107,20 +107,19 @@ def RunFactorio(first: int, last: int, size: int, offset: Position, mods: Path, 
         if match != None:
             counts[match.group(1)] = int(match.group(2))
 
-def EvalZone(seed: int, preview: np.ndarray, counts, minimum_quantities) -> Zone:
-    W, H = preview.shape
-    zone = Zone()
-
+def EvalZone(seed: int, preview: np.ndarray, counts, minimum_quantities) -> Union[Zone | None]:
     if counts["iron-ore"] < minimum_quantities["iron"] or\
         counts["copper-ore"] < minimum_quantities["copper"] or\
         counts["coal"] < minimum_quantities["coal"] or\
         counts["stone"] < minimum_quantities["stone"]:
-        return zone
+        return None
 
-    zone.iron_area = minimum_quantities["iron"]
-    zone.copper_area = minimum_quantities["copper"]
-    zone.coal_area = minimum_quantities["coal"]
-    zone.stone_area = minimum_quantities["stone"]
+    W, H = preview.shape
+    zone = Zone()
+    zone.iron_area = counts["iron-ore"]
+    zone.copper_area = counts["copper-ore"]
+    zone.coal_area = counts["coal"]
+    zone.stone_area = counts["stone"]
 
     iron_mask = preview[:, :] != np.uint8(0)   # iron
     copper_mask = preview[:, :] != np.uint8(1) # copper
@@ -156,7 +155,9 @@ def EvalZone(seed: int, preview: np.ndarray, counts, minimum_quantities) -> Zone
 ## maps should be sorted from lowest seed to highest
 def EvalBackside(maps: List[MapData], direction: Direction, minimum_quantities):
     def Helper(i: int, seed: int, preview: np.ndarray, counts: Dict[str, int]):
-        maps[i].backside_zones[direction] = EvalZone(seed, preview, counts, minimum_quantities["backside"])
+        zone = EvalZone(seed, preview, counts, minimum_quantities["backside"])
+        if zone != None:
+            maps[i].backside_zones[direction] = zone
 
     base_offset = Position(backside_offset, 0)
     RunFactorio(maps[0].seed, maps[len(maps) - 1].seed, backside_radius * 2,
@@ -178,7 +179,12 @@ def EvalSeeds(first: int, nb: int, minimum_quantities) -> List[MapData]:
     return maps
 
 def WriteOutput(maps: List[MapData]):
-    def ZoneHelper(zone: Zone) -> List[str]:
+    def ZoneHelper(zones, d) -> List[str]:
+        if not d in zones:
+            zone = Zone()
+        else:
+            zone = zones[d]
+
         out = [
             str(zone.iron_area),
             str(zone.copper_area),
@@ -186,8 +192,8 @@ def WriteOutput(maps: List[MapData]):
             str(zone.stone_area),
             str(zone.starting_area_pos[0]),
             str(zone.starting_area_pos[1]),
-            str(zone.iron_coal_distance),
             str(zone.iron_copper_distance),
+            str(zone.iron_coal_distance),
             str(zone.iron_stone_distance),
             str(zone.coal_lake_distance),
         ]
@@ -198,19 +204,22 @@ def WriteOutput(maps: List[MapData]):
         writer = csv.writer(file)
 
         for map in maps:
+            if len(map.backside_zones) == 0:
+                continue
+
             writer.writerow(
                 [map.seed] +
-                ZoneHelper(map.backside_zones[Direction.EAST]) +
-                ZoneHelper(map.backside_zones[Direction.SOUTH]) +
-                ZoneHelper(map.backside_zones[Direction.WEST]) +
-                ZoneHelper(map.backside_zones[Direction.NORTH])
+                ZoneHelper(map.backside_zones, Direction.EAST) +
+                ZoneHelper(map.backside_zones, Direction.SOUTH) +
+                ZoneHelper(map.backside_zones, Direction.WEST) +
+                ZoneHelper(map.backside_zones, Direction.NORTH)
             )
 
 @timer("main")
 def main():
     global factorio_path
 
-    atexit.register(lambda: shutil.rmtree(factorio_data))
+    # atexit.register(lambda: shutil.rmtree(factorio_data))
 
     parser = argparse.ArgumentParser(
         prog="Factorio Seed Finder"
@@ -225,7 +234,7 @@ def main():
 
     args = parser.parse_args()
 
-    factorio_path = Path(args.factorio_path)
+    factorio_path = Path(args.factorio_path).absolute()
     if not IsFactorioPathValid(factorio_path):
         print("The provided path for Factorio is not valid.")
         return
@@ -249,9 +258,9 @@ def main():
                     f"{p}S_area",
                     f"{p}starting_area_pos_x",
                     f"{p}starting_area_pos_y",
-                    f"{p}Fe_C_d",
                     f"{p}Fe_Cu_d",
-                    f"{p}fe_S_d",
+                    f"{p}Fe_C_d",
+                    f"{p}Fe_S_d",
                     f"{p}C_lake_d"
                 ]
             writer.writerow(titles)
