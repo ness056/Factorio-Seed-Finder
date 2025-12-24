@@ -16,7 +16,7 @@ import shutil
 import sqlite3
 from inputimeout import inputimeout, TimeoutOccurred
 
-root_dir = (Path(os.path.realpath(__file__)) / "../..").absolute()
+root_dir = (Path(os.path.realpath(__file__)) / "../..").resolve().absolute()
 mod_path = root_dir / "./mods"
 map_gen_settings_path = root_dir / "./map-gen-settings.json"
 preview_path = root_dir / "./previews"
@@ -264,7 +264,7 @@ def DatabaseHandler(path: Path, queue: mp.JoinableQueue, return_queue: mp.Queue)
             command.execute(db, return_queue)
 
 def main():
-    # atexit.register(lambda: shutil.rmtree(factorio_data))
+    atexit.register(lambda: shutil.rmtree(factorio_data))
 
     parser = argparse.ArgumentParser(
         prog="Factorio Seed Finder"
