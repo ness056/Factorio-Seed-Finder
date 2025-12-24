@@ -369,6 +369,7 @@ def main():
     for p in processes:
         p.join()
 
+    print(f"Generated {last_seed.value - starting_seed} seeds in {time.time() - starting_time:.3f}s.")
     print("Saving results...")
     queue.put(Execute(f"""
         INSERT INTO progress (id, last_seed)
