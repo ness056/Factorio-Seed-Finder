@@ -16,10 +16,11 @@ import shutil
 import sqlite3
 from inputimeout import inputimeout, TimeoutOccurred
 
-mod_path = Path("./mods").absolute()
-map_gen_settings_path = Path("./map-gen-settings.json").absolute()
-preview_path = Path("./previews").absolute()
-factorio_data = Path("./data").absolute()
+root_dir = (Path(os.path.realpath(__file__)) / "../..").absolute()
+mod_path = root_dir / "./mods"
+map_gen_settings_path = root_dir / "./map-gen-settings.json"
+preview_path = root_dir / "./previews"
+factorio_data = root_dir / "./data"
 
 starting_radius = 128
 backside_radius = 160
@@ -118,7 +119,7 @@ def RunFactorio(factorio_path: Path, first: int, last: int, size: int, offset: P
             preview = img[:, :, 0]
             callback(i, seed, preview, counts)
             i += 1
-            # os.remove(path)
+            os.remove(path)
 
         if match != None:
             seed = int(match.group(1))
@@ -263,7 +264,7 @@ def DatabaseHandler(path: Path, queue: mp.JoinableQueue, return_queue: mp.Queue)
             command.execute(db, return_queue)
 
 def main():
-    atexit.register(lambda: shutil.rmtree(factorio_data))
+    # atexit.register(lambda: shutil.rmtree(factorio_data))
 
     parser = argparse.ArgumentParser(
         prog="Factorio Seed Finder"
@@ -369,7 +370,9 @@ def main():
     for p in processes:
         p.join()
 
-    print(f"Generated {last_seed.value - starting_seed} seeds in {time.time() - starting_time:.3f}s.")
+    nb_seeds = last_seed.value - starting_seed
+    uptime = time.time() - starting_time
+    print(f"Generated {nb_seeds} seeds in {uptime:.3f}s. ({nb_seeds / uptime:.3f})/s")
     print("Saving results...")
     queue.put(Execute(f"""
         INSERT INTO progress (id, last_seed)
