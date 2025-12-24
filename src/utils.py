@@ -4,6 +4,8 @@ from typing import *
 import math
 import time
 from functools import wraps
+import numpy as np
+from numba import njit
 
 class Timer:
     _totals = {}
@@ -59,6 +61,9 @@ class Direction(IntEnum):
     WEST = 2
     NORTH = 3
 
+def OppositeDirection(direction: Direction) -> Direction:
+    return (direction + 2) % 4
+
 class Position:
     x: int
     y: int
@@ -76,10 +81,6 @@ class Position:
 
     def to_tuple(self) -> Tuple[int, int]:
         return (self.x, self.y)
-
-    @classmethod
-    def from_tuple(cls, t: Tuple[int, int]) -> Position:
-        return cls(int(t[0]), int(t[1]))
 
     def copy(self) -> Position:
         return Position(self.x, self.y)
@@ -145,30 +146,32 @@ class Position:
     def Max(p1: Position, p2: Position) -> Position:
         return Position(max(p1.x, p2.x), max(p1.y, p2.y))
 
-class Area:
-    left_top: Position
-    right_bottom: Position
+@njit
+def FirstZeroPosition(array: np.ndarray, direction: Direction) -> Tuple[int, int]:
+    H, W = array.shape
 
-    def __init__(self, left_top: Position, right_bottom: Position):
-        self.left_top = left_top
-        self.right_bottom = right_bottom
+    if direction == 0:
+        for x in range(W - 1, -1, -1):
+            for y in range(H):
+                if array[y, x] == 0:
+                    return (y, x)
 
-    @staticmethod
-    def FromCenterAndRadius(center: Position, radius: int):
-        vec = Position(radius, radius)
-        return Area(center - vec, center + vec)
+    elif direction == 1:       
+        for y in range(H - 1, -1, -1):
+            for x in range(W):
+                if array[y, x] == 0:
+                    return (y, x)
 
-    def Center(self) -> Position:
-        return (self.left_top + self.right_bottom) / 2
+    elif direction == 2:   
+        for x in range(W):
+            for y in range(H):
+                if array[y, x] == 0:
+                    return (y, x)
 
-    def Collides(self, arg: Union[Position, Area]) -> bool:
-        if type(arg) == Position:
-            return max(self.left_top.x - arg.x, 0, arg.x - self.right_bottom.x) == 0 and\
-                   max(self.left_top.y - arg.y, 0, arg.y - self.right_bottom.y) == 0
-        elif type(arg) == Area:
-            return self.left_top.x <= arg.right_bottom.x and\
-                   self.right_bottom.x >= arg.left_top.x and\
-                   self.left_top.y <= arg.right_bottom.y and\
-                   self.right_bottom.y >= arg.left_top.y
-        else:
-            raise TypeError("Area.Collides first argument must be Position or Area")
+    else:
+        for y in range(H):
+            for x in range(W):
+                if array[y, x] == 0:
+                    return (y, x)
+                
+    return (-1, -1)

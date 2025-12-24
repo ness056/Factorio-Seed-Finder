@@ -6,47 +6,59 @@ import re
 from typing import *
 from utils import *
 import os
-import csv
 import cv2
 import numpy as np
 import pyspng
 import json
-import concurrent.futures
-import threading
+import multiprocessing as mp
+from multiprocessing.sharedctypes import Synchronized
 import shutil
+import sqlite3
+from inputimeout import inputimeout, TimeoutOccurred
 
 mod_path = Path("./mods").absolute()
 map_gen_settings_path = Path("./map-gen-settings.json").absolute()
 preview_path = Path("./previews").absolute()
-factorio_path = Path("")
 factorio_data = Path("./data").absolute()
 
 starting_radius = 128
 backside_radius = 160
-backside_offset = 120 + backside_radius
+backside_offset = 320
 
-copper_burner_weight = np.float32(0.7)
-coal_burner_weight = np.float32(1)
-stone_burner_weight = np.float32(0.2)
+copper_burner_weight = np.float16(0.7)
+coal_burner_weight = np.float16(1)
+stone_burner_weight = np.float16(0.25)
 
-class Zone:
-    def __init__(self):
-        self.iron_area: int = 0
-        self.copper_area: int = 0
-        self.coal_area: int = 0
-        self.stone_area: int = 0
+max_seed = 4294967296
 
-        self.starting_area_pos: Tuple[int, int] = (0, 0)
-        self.iron_coal_distance: float = 1e20
-        self.iron_copper_distance: float = 1e20
-        self.iron_stone_distance: float = 1e20
+class Stop:
+    def execute(self, db: sqlite3.Connection, return_queue: mp.JoinableQueue):
+        pass
 
-        self.coal_lake_distance: float = 1e20
+class Commit:
+    def execute(self, db: sqlite3.Connection, return_queue: mp.JoinableQueue):
+        db.commit()
 
-class MapData:
-    def __init__(self, seed: int):
-        self.seed = seed
-        self.backside_zones: Dict[Direction, Zone] = {}
+class Execute:
+    def __init__(self, command: str):
+        self._command = command
+
+    def execute(self, db: sqlite3.Connection, return_queue: mp.JoinableQueue):
+        db.execute(self._command)
+
+class LastSeedHelper:
+    def execute(self, db: sqlite3.Connection, return_queue: mp.JoinableQueue):
+        last_seed_ex = db.execute("""
+        SELECT last_seed FROM progress WHERE id=1
+        """).fetchone()
+        if last_seed_ex == None:
+            return_queue.put(0)
+            print("Starting analyzing from seed 0.")
+        else:
+            return_queue.put(last_seed_ex[0])
+            print(f"Resuming analyzing from seed {last_seed_ex[0]}.")
+
+        return False
 
 def IsFactorioPathValid(path: Path) -> bool:
     if not path.exists() or not path.is_file():
@@ -57,10 +69,12 @@ def IsFactorioPathValid(path: Path) -> bool:
 regex_gen_start = re.compile("^\\s*[\\d|\\.]* Generating map preview: seed=(\\d*)")
 regex_report = re.compile("^\\s*[\\d|\\.]* ([\\w|-]*): totalEntityCount=(\\d*)")
 regex_goodbye = re.compile("^\\s*[\\d|\\.]* Goodbye")
-def RunFactorio(first: int, last: int, size: int, offset: Position, mods: Path, reports: Tuple[str], callback: Callable[[int, int, np.ndarray, Dict[str, int]], None]):
+regex_error = re.compile("error", re.RegexFlag.IGNORECASE)
+def RunFactorio(factorio_path: Path, first: int, last: int, size: int, offset: Position, mods: Path,
+                reports: Tuple[str], callback: Callable[[int, int, np.ndarray, Dict[str, int]], None]):
     assert(first % 2 == 0 and last % 2 == 0)
 
-    data_path = factorio_data / f"{threading.get_ident()}"
+    data_path = factorio_data / f"{os.getpid()}"
     os.makedirs(data_path, exist_ok=True)
     with open(data_path / "config.ini", "w") as f:
         f.write(f"[path]\nwrite-data={data_path}{os.sep}\nread-data=__PATH__executable__/../../data")
@@ -82,11 +96,18 @@ def RunFactorio(first: int, last: int, size: int, offset: Position, mods: Path, 
     seed = None
     counts = {}
     i = 0
+    error = False
 
     while True:
         line = process.stdout.readline().decode()
         if not line:
             break
+
+        if regex_error.match(line):
+            error = True
+
+        if error:
+            print(f"Factorio {os.getpid()}: {line}")
 
         match = regex_gen_start.match(line)
         if seed != None and (match != None or regex_goodbye.match(line) != None):
@@ -97,7 +118,7 @@ def RunFactorio(first: int, last: int, size: int, offset: Position, mods: Path, 
             preview = img[:, :, 0]
             callback(i, seed, preview, counts)
             i += 1
-            os.remove(path)
+            # os.remove(path)
 
         if match != None:
             seed = int(match.group(1))
@@ -107,19 +128,18 @@ def RunFactorio(first: int, last: int, size: int, offset: Position, mods: Path, 
         if match != None:
             counts[match.group(1)] = int(match.group(2))
 
-def EvalZone(seed: int, preview: np.ndarray, counts, minimum_quantities) -> Union[Zone | None]:
-    if counts["iron-ore"] < minimum_quantities["iron"] or\
-        counts["copper-ore"] < minimum_quantities["copper"] or\
-        counts["coal"] < minimum_quantities["coal"] or\
-        counts["stone"] < minimum_quantities["stone"]:
+    if error:
+        raise RuntimeError("Factorio has thrown an error")
+
+def EvalZone(queue: mp.JoinableQueue, seed: int, direction: Direction,
+             preview: np.ndarray, counts, criteria, is_front_side: bool):
+    if counts["iron-ore"] < criteria["min_iron"] or\
+        counts["copper-ore"] < criteria["min_copper"] or\
+        counts["coal"] < criteria["min_coal"] or\
+        counts["stone"] < criteria["min_stone"]:
         return None
 
-    W, H = preview.shape
-    zone = Zone()
-    zone.iron_area = counts["iron-ore"]
-    zone.copper_area = counts["copper-ore"]
-    zone.coal_area = counts["coal"]
-    zone.stone_area = counts["stone"]
+    H, W = preview.shape
 
     iron_mask = preview[:, :] != np.uint8(0)   # iron
     copper_mask = preview[:, :] != np.uint8(1) # copper
@@ -139,96 +159,119 @@ def EvalZone(seed: int, preview: np.ndarray, counts, minimum_quantities) -> Unio
     sums += iron_mask.astype(np.uint8) * np.uint8(255)
     min_i = np.argmin(sums)
 
-    x = min_i // W
-    y = min_i % W
+    x = min_i % W
+    y = min_i // H
 
-    zone.starting_area_pos = (x, y)
-    zone.iron_copper_distance = weighted_copper[x, y]
-    zone.iron_coal_distance = weighted_coal[x, y]
-    zone.iron_stone_distance = weighted_stone[x, y]
+    if is_front_side:
+        coal_dt += water_mask.astype(np.uint8) * np.uint8(255)
+        coal_lake_distance = np.min(coal_dt)
 
-    coal_dt += water_mask.astype(np.uint8) * np.uint8(255)
-    zone.coal_lake_distance = np.min(coal_dt)
+        iron_center_distance = 0
+    else:
+        coal_lake_distance = 0
 
-    return zone
+        y_, x_ = FirstZeroPosition(iron_mask, OppositeDirection(direction))
+        if direction == Direction.EAST:
+            iron_center_distance = x_ + backside_offset - backside_radius
+        elif direction == Direction.SOUTH:
+            iron_center_distance = y_ + backside_offset - backside_radius
+        elif direction == Direction.WEST:
+            iron_center_distance = - x_ + backside_offset + backside_radius
+        else:
+            iron_center_distance = - y_ + backside_offset + backside_radius
+
+    queue.put(Execute(f"""
+        INSERT INTO zones (seed, direction, iron_area, copper_area, coal_area, stone_area,
+                           iron_copper_d, iron_coal_d, iron_stone_d, lake_coal_d, iron_center_d)
+        VALUES ({seed}, {direction}, {counts["iron-ore"]}, {counts["copper-ore"]}, {counts["coal"]}, {counts["stone"]},
+                {copper_dt[y, x]}, {coal_dt[y, x]}, {stone_dt[y, x]}, {coal_lake_distance}, {iron_center_distance})
+        """)
+    )
 
 ## maps should be sorted from lowest seed to highest
-def EvalBackside(maps: List[MapData], direction: Direction, minimum_quantities):
+def EvalBackside(factorio_path: Path, queue: mp.JoinableQueue, first: int, batch_size: int,
+                 direction: Direction, criteria):
+    
+    assert(first % 2 == 0 and batch_size % 2 == 0)
+    offset = Position(backside_offset, 0).rotate(direction)
+
     def Helper(i: int, seed: int, preview: np.ndarray, counts: Dict[str, int]):
-        zone = EvalZone(seed, preview, counts, minimum_quantities["backside"])
-        if zone != None:
-            maps[i].backside_zones[direction] = zone
+        EvalZone(queue, seed, direction, preview, counts, criteria, False)
 
-    base_offset = Position(backside_offset, 0)
-    RunFactorio(maps[0].seed, maps[len(maps) - 1].seed, backside_radius * 2,
-                base_offset.rotate(direction), mod_path / "regular-patches", ("iron-ore", "copper-ore", "coal", "stone"), Helper)
+    RunFactorio(factorio_path, first, first + batch_size - 2, backside_radius * 2,
+                offset, mod_path, ("iron-ore", "copper-ore", "coal", "stone"), Helper)
 
-def EvalSeeds(first: int, nb: int, minimum_quantities) -> List[MapData]:
-    assert(first % 2 == 0 and nb % 2 == 0)
-    maps = [MapData(s) for s in range(first, first + nb, 2)]
+def EvalSeeds(factorio_path: Path, queue: mp.JoinableQueue, exit: Synchronized,
+              last_seed: Synchronized, batch_size: int, criteria):
+    
+    with open(mod_path / "mod-list.json", "w") as f:
+        f.write("""
+{
+    "mods": [
+        {
+            "name": "base",
+            "enabled": true
+        },
+        {
+            "name": "elevated-rails",
+            "enabled": false
+        },
+        {
+            "name": "quality",
+            "enabled": false
+        },
+        {
+            "name": "space-age",
+            "enabled": false
+        },
+        {
+            "name": "common",
+            "enabled": true
+        },
+        {
+            "name": "regular-patches",
+            "enabled": true
+        }
+    ]
+}
+""")
+    
+    while exit.value == False:
+        with last_seed.get_lock():
+            seed = last_seed.value
+            last_seed.value += batch_size
 
-    EvalBackside(maps, Direction.EAST, minimum_quantities)
-    print("east done")
-    EvalBackside(maps, Direction.SOUTH, minimum_quantities)
-    print("south done")
-    EvalBackside(maps, Direction.WEST, minimum_quantities)
-    print("west done")
-    EvalBackside(maps, Direction.NORTH, minimum_quantities)
-    print("north done")
+        if seed >= max_seed:
+            break
 
-    return maps
+        if seed + batch_size > max_seed:
+            batch_size = max_seed - seed
 
-def WriteOutput(maps: List[MapData]):
-    def ZoneHelper(zones, d) -> List[str]:
-        if not d in zones:
-            zone = Zone()
+        EvalBackside(factorio_path, queue, seed, batch_size, Direction.EAST, criteria)
+        EvalBackside(factorio_path, queue, seed, batch_size, Direction.SOUTH, criteria)
+        EvalBackside(factorio_path, queue, seed, batch_size, Direction.WEST, criteria)
+        EvalBackside(factorio_path, queue, seed, batch_size, Direction.NORTH, criteria)
+
+def DatabaseHandler(path: Path, queue: mp.JoinableQueue, return_queue: mp.Queue):
+    db = sqlite3.connect(path)
+    while True:
+        command = queue.get()
+        queue.task_done()
+        if isinstance(command, Stop):
+            break
         else:
-            zone = zones[d]
+            command.execute(db, return_queue)
 
-        out = [
-            str(zone.iron_area),
-            str(zone.copper_area),
-            str(zone.coal_area),
-            str(zone.stone_area),
-            str(zone.starting_area_pos[0]),
-            str(zone.starting_area_pos[1]),
-            str(zone.iron_copper_distance),
-            str(zone.iron_coal_distance),
-            str(zone.iron_stone_distance),
-            str(zone.coal_lake_distance),
-        ]
-
-        return out
-
-    with open("out.csv", "a", newline='') as file:
-        writer = csv.writer(file)
-
-        for map in maps:
-            if len(map.backside_zones) == 0:
-                continue
-
-            writer.writerow(
-                [map.seed] +
-                ZoneHelper(map.backside_zones, Direction.EAST) +
-                ZoneHelper(map.backside_zones, Direction.SOUTH) +
-                ZoneHelper(map.backside_zones, Direction.WEST) +
-                ZoneHelper(map.backside_zones, Direction.NORTH)
-            )
-
-@timer("main")
 def main():
-    global factorio_path
-
-    # atexit.register(lambda: shutil.rmtree(factorio_data))
+    atexit.register(lambda: shutil.rmtree(factorio_data))
 
     parser = argparse.ArgumentParser(
         prog="Factorio Seed Finder"
     )
 
-    parser.add_argument("-f", "--factorio-path", required=True, type=str)
-    parser.add_argument("--minimum-quantities", required=True, type=str)
-    parser.add_argument("-s", "--first-seed", required=True, type=int)
-    parser.add_argument("--batch-count", required=True, type=int)
+    parser.add_argument("--factorio-path", required=True, type=str)
+    parser.add_argument("--criteria", required=True, type=str)
+    parser.add_argument("--out", required=True, type=str)
     parser.add_argument("--batch-size", default=25000, type=int)
     parser.add_argument("--factorio-instance-count", default=1, type=int)
 
@@ -239,34 +282,105 @@ def main():
         print("The provided path for Factorio is not valid.")
         return
     
-    with open(args.minimum_quantities) as f:
-        minimum_quantities = json.load(f)
+    if args.batch_size % 2 != 0:
+        print("--batch-size must be a multiple of 2.")
+    
+    with open(args.criteria) as f:
+        criteria = json.load(f)
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=args.factorio_instance_count) as executor:
-        futures = [executor.submit(EvalSeeds, s, args.batch_size, minimum_quantities)\
-                   for s in range(args.first_seed, args.batch_count*args.batch_size + args.first_seed, args.batch_size)]
+    return_queue = mp.Queue()
+    queue = mp.JoinableQueue()
+    mp.Process(target=DatabaseHandler, args=(Path(args.out), queue, return_queue), daemon=True).start()
 
-        with open("out.csv", "w", newline='') as file:
-            writer = csv.writer(file)
+    queue.put(Execute("""
+        CREATE TABLE IF NOT EXISTS zones (
+            seed BIGINT,
+            direction SMALLINT,
 
-            titles = ["seed"]
-            for p in ("e_", "s_", "w_", "n_"):
-                titles += [
-                    f"{p}Fe_area",
-                    f"{p}Cu_area",
-                    f"{p}C_area",
-                    f"{p}S_area",
-                    f"{p}starting_area_pos_x",
-                    f"{p}starting_area_pos_y",
-                    f"{p}Fe_Cu_d",
-                    f"{p}Fe_C_d",
-                    f"{p}Fe_S_d",
-                    f"{p}C_lake_d"
-                ]
-            writer.writerow(titles)
+            iron_area SMALLINT,
+            copper_area SMALLINT,
+            coal_area SMALLINT,
+            stone_area SMALLINT,
 
-        for future in concurrent.futures.as_completed(futures):
-            WriteOutput(future.result())
+            iron_copper_d SMALLINT,
+            iron_coal_d SMALLINT,
+            iron_stone_d SMALLINT,
+
+            lake_coal_d SMALLINT,
+                    
+            iron_center_d SMALLINT
+        )
+        """)
+    )
+
+    queue.put(Execute("""
+        CREATE TABLE IF NOT EXISTS progress (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            last_seed INTEGER
+        )
+        """)
+    )
+
+    queue.put((LastSeedHelper()))
+    last_seed = mp.Value("i", return_queue.get())
+    starting_seed = last_seed.value
+    starting_time = time.time()
+
+    exit = mp.Value("b", False)
+    processes = [mp.Process(target=EvalSeeds, args=(factorio_path, queue, exit, last_seed, args.batch_size, criteria))
+                 for _ in range(args.factorio_instance_count)]
+
+    for p in processes:
+        p.start()
+
+    next_progress_print = time.time() + 60*30
+    next_auto_save = time.time() + 60*10
+    while exit.value == False:
+        try:
+            s = inputimeout(prompt="Type 'exit' to save the current progress and exit. Type stats to get statistics. ",
+                            timeout=min(next_progress_print, next_auto_save) - time.time())
+        except TimeoutOccurred:
+            s = None
+
+        current_time = time.time()
+
+        if next_progress_print <= current_time or (s != None and s.strip() == "stats"):
+            print(f"Uptime: {current_time - starting_time:.2f}s")
+            print(f"Current progress: seed {last_seed.value:_}/4_294_967_296 ({100 * last_seed.value / max_seed:.3f}%).")
+            print(f"{((last_seed.value - starting_seed) / (current_time - starting_time)):.3f} seeds per second on average.")
+            next_progress_print = current_time + 60*30
+
+        if next_auto_save <= current_time:
+            print(f"Auto saving progress.")
+            queue.put(Execute(f"""
+                INSERT INTO progress (id, last_seed)
+                VALUES (1, {last_seed.value - (args.batch_size * args.factorio_instance_count)})
+                ON CONFLICT(id) DO UPDATE SET last_seed=excluded.last_seed
+                """)
+            )
+            queue.put(Commit())
+            next_auto_save = current_time + 60*10
+
+        if s != None:
+            if s.strip() == "exit":
+                exit.value = True
+
+    print("Waiting for batches to finish generate, this may take a few minutes...")
+    for p in processes:
+        p.join()
+
+    print("Saving results...")
+    queue.put(Execute(f"""
+        INSERT INTO progress (id, last_seed)
+        VALUES (1, {last_seed.value})
+        ON CONFLICT(id) DO UPDATE SET last_seed=excluded.last_seed
+        """)
+    )
+    queue.put(Commit())
+    queue.put(Stop())
+    queue.join()
+
+    print("Goodbye :)")
 
 if __name__ == "__main__":
     main()

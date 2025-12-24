@@ -1,5 +1,7 @@
 .vscode
 .venv
+*__pycache__
 
 previews
-*__pycache__
+data
+mods/mod-list.json
