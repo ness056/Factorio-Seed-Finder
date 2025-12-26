@@ -15,6 +15,7 @@ from multiprocessing.sharedctypes import Synchronized
 import shutil
 import sqlite3
 from inputimeout import inputimeout, TimeoutOccurred
+import psutil
 
 root_dir = (Path(os.path.realpath(__file__)) / "../..").resolve().absolute()
 mod_path = root_dir / "./mods"
@@ -76,6 +77,7 @@ def RunFactorio(factorio_path: Path, first: int, last: int, size: int, offset: P
     assert(first % 2 == 0 and last % 2 == 0)
 
     data_path = factorio_data / f"{os.getpid()}"
+    os.makedirs(preview_path, exist_ok=True)
     os.makedirs(data_path, exist_ok=True)
     with open(data_path / "config.ini", "w") as f:
         f.write(f"[path]\nwrite-data={data_path}{os.sep}\nread-data=__PATH__executable__/../../data")
@@ -96,7 +98,6 @@ def RunFactorio(factorio_path: Path, first: int, last: int, size: int, offset: P
     
     seed = None
     counts = {}
-    i = 0
     error = False
 
     while True:
@@ -117,8 +118,7 @@ def RunFactorio(factorio_path: Path, first: int, last: int, size: int, offset: P
                 np_img = pyspng.load(f.read())
             img = np.asarray(np_img)
             preview = img[:, :, 0]
-            callback(i, seed, preview, counts)
-            i += 1
+            callback(seed, preview, counts)
             os.remove(path)
 
         if match != None:
@@ -196,7 +196,7 @@ def EvalBackside(factorio_path: Path, queue: mp.JoinableQueue, first: int, batch
     assert(first % 2 == 0 and batch_size % 2 == 0)
     offset = Position(backside_offset, 0).rotate(direction)
 
-    def Helper(i: int, seed: int, preview: np.ndarray, counts: Dict[str, int]):
+    def Helper(seed: int, preview: np.ndarray, counts: Dict[str, int]):
         EvalZone(queue, seed, direction, preview, counts, criteria, False)
 
     RunFactorio(factorio_path, first, first + batch_size - 2, backside_radius * 2,
@@ -329,7 +329,7 @@ def main():
 
     exit = mp.Value("b", False)
     processes = [mp.Process(target=EvalSeeds, args=(factorio_path, queue, exit, last_seed, args.batch_size, criteria))
-                 for _ in range(args.factorio_instance_count)]
+                 for i in range(args.factorio_instance_count)]
 
     for p in processes:
         p.start()
@@ -338,7 +338,7 @@ def main():
     next_auto_save = time.time() + 60*10
     while exit.value == False:
         try:
-            s = inputimeout(prompt="Type 'exit' to save the current progress and exit. Type stats to get statistics. ",
+            s = inputimeout(prompt="Type 'exit' to save the current progress and exit. Type 'stats' to get statistics. ",
                             timeout=min(next_progress_print, next_auto_save) - time.time())
         except TimeoutOccurred:
             s = None
@@ -346,7 +346,7 @@ def main():
         current_time = time.time()
 
         if next_progress_print <= current_time or (s != None and s.strip() == "stats"):
-            print(f"Uptime: {current_time - starting_time:.2f}s")
+            print(f"Uptime: {current_time - starting_time:.2f}s. CPU usage: {psutil.cpu_percent(interval=1)}")
             print(f"Current progress: seed {last_seed.value:_}/4_294_967_296 ({100 * last_seed.value / max_seed:.3f}%).")
             print(f"{((last_seed.value - starting_seed) / (current_time - starting_time)):.3f} seeds per second on average.")
             next_progress_print = current_time + 60*30
