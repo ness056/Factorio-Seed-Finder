@@ -1,0 +1,6 @@
+opencv-python
+numpy
+pyspng
+pandas
+inputimeout
+numba
